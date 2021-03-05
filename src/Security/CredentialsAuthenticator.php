@@ -1,0 +1,187 @@
+<?php
+
+namespace App\Security;
+
+use App\Entity\User;
+use App\Exception\AuthenticatorException;
+use App\Service\SecurityAuthService;
+use Doctrine\ORM\EntityManagerInterface;
+use Exception;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Encoder\UserPasswordEncoderInterface;
+use Symfony\Component\Security\Core\Exception\AuthenticationException;
+use Symfony\Component\Security\Core\Exception\CustomUserMessageAuthenticationException;
+use Symfony\Component\Security\Core\Exception\InvalidCsrfTokenException;
+use Symfony\Component\Security\Core\Security;
+use Symfony\Component\Security\Core\User\UserInterface;
+use Symfony\Component\Security\Core\User\UserProviderInterface;
+use Symfony\Component\Security\Csrf\CsrfToken;
+use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
+use Symfony\Component\Security\Guard\Authenticator\AbstractFormLoginAuthenticator;
+use Symfony\Component\Security\Guard\PasswordAuthenticatedInterface;
+use Symfony\Component\Security\Http\Util\TargetPathTrait;
+
+class CredentialsAuthenticator extends AbstractFormLoginAuthenticator implements PasswordAuthenticatedInterface
+{
+    use TargetPathTrait;
+
+    // Login route
+    public const LOGIN_ROUTE = 'app_login';
+
+    /**
+     * @var EntityManagerInterface
+     */
+    private $entityManager;
+
+    /**
+     * @var UrlGeneratorInterface
+     */
+    private $urlGenerator;
+
+    /**
+     * @var CsrfTokenManagerInterface
+     */
+    private $csrfTokenManager;
+
+    /**
+     * @var UserPasswordEncoderInterface
+     */
+    private $passwordEncoder;
+
+    /**
+     * @var SecurityAuthService Used for handle user authentication
+     */
+    private $securityAuthService;
+
+    public function __construct(EntityManagerInterface $entityManager, UrlGeneratorInterface $urlGenerator, CsrfTokenManagerInterface $csrfTokenManager, UserPasswordEncoderInterface $passwordEncoder, SecurityAuthService $securityAuthService)
+    {
+        $this->entityManager = $entityManager;
+        $this->urlGenerator = $urlGenerator;
+        $this->csrfTokenManager = $csrfTokenManager;
+        $this->passwordEncoder = $passwordEncoder;
+        $this->securityAuthService = $securityAuthService;
+    }
+
+    public function supports(Request $request)
+    {
+        return self::LOGIN_ROUTE === $request->attributes->get('_route')
+            && $request->isMethod('POST');
+    }
+
+    public function getCredentials(Request $request)
+    {
+        $credentials = [
+            'email' => $request->request->get('email'),
+            'password' => $request->request->get('password'),
+            'csrf_token' => $request->request->get('_csrf_token'),
+        ];
+
+        $request->getSession()->set(
+            Security::LAST_USERNAME,
+            $credentials['email']
+        );
+
+        return $credentials;
+    }
+
+    public function getUser($credentials, UserProviderInterface $userProvider)
+    {
+        $token = new CsrfToken('authenticate', $credentials['csrf_token']);
+
+        if (!$this->csrfTokenManager->isTokenValid($token)) {
+            throw new InvalidCsrfTokenException();
+        }
+
+        $user = $this->entityManager->getRepository(User::class)->findOneBy(['email' => $credentials['email']]);
+
+        if (!$user) {
+            throw new CustomUserMessageAuthenticationException('Email could not be found.');
+        }
+
+        // Handle user restriction
+        $userRestriction = $this->securityAuthService->handleUserRestriction($user->getId());
+
+        // If the maximum number of login attempts has been reached for an user, throw an exception
+        if ($userRestriction) {
+            throw new CustomUserMessageAuthenticationException('The maximum number of login attempts has been reached. Please try again in '
+                .$userRestriction['remaining_time'].' minutes!');
+        }
+
+        return $user;
+    }
+
+    public function checkCredentials($credentials, UserInterface $user)
+    {
+        $isPasswordValid = $this->passwordEncoder->isPasswordValid($user, $credentials['password']);
+
+        // If the password is valid, reset user restriction for this step do not authenticate the user, but
+        // redirect him to complete second step throwing a custom exception
+        if ($isPasswordValid) {
+            $this->securityAuthService->resetUserRestriction($user->getId(), true);
+            $authenticatorException = new AuthenticatorException($user);
+            return $authenticatorException->readyForStepTwo();
+        } else {
+            $this->securityAuthService->setLoginAttempt($user->getId());
+        }
+
+        return $isPasswordValid;
+    }
+
+    /**
+     * Used to upgrade (rehash) the user's password automatically over time.
+     *
+     * @param $credentials
+     *
+     * @return string|null
+     */
+    public function getPassword($credentials): ?string
+    {
+        return $credentials['password'];
+    }
+
+    public function onAuthenticationFailure(Request $request, AuthenticationException $exception)
+    {
+        // If custom exception is thrown (this means that the authentication with credentials was successful), store the
+        // user in session, and also "step" key with value 2
+        if ($exception instanceof AuthenticatorException) {
+            $request->getSession()->set(
+                'user',
+                $exception->getUser()
+            );
+
+            $request->getSession()->set(
+                'step',
+                2
+            );
+
+            $this->securityAuthService->generateAndSend($exception->getUser());
+
+            return new RedirectResponse($this->urlGenerator->generate('app_two_factor'));
+        }
+
+        // If there is a different exception, handle it using parent method
+        return parent::onAuthenticationFailure($request, $exception);
+    }
+
+    /**
+     * @param Request $request
+     * @param TokenInterface $token
+     * @param string $providerKey
+     * @return Response|void|null
+     *
+     * @throws Exception
+     */
+    public function onAuthenticationSuccess(Request $request, TokenInterface $token, string $providerKey)
+    {
+        throw new Exception('Cannot be fully authenticated without the second step!');
+    }
+
+    protected function getLoginUrl()
+    {
+        return $this->urlGenerator->generate(self::LOGIN_ROUTE);
+    }
+}
